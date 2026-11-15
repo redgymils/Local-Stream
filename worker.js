@@ -2,7 +2,6 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // Handle CORS preflight requests
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         headers: {
@@ -13,13 +12,11 @@ export default {
       });
     }
 
-    // Intercept /proxy requests for MPEG-DASH (.mpd) and video segments
     if (url.pathname === '/proxy') {
       let targetUrl = url.searchParams.get('url');
       const base = url.searchParams.get('base');
       const seg = url.searchParams.get('seg');
 
-      // Reconstruct segment URL if requested via injected <BaseURL>
       if (!targetUrl && base) {
         targetUrl = base + (seg || '');
       }
@@ -29,16 +26,29 @@ export default {
       }
 
       try {
-        const parsedTarget = new URL(targetUrl);
-        const response = await fetch(parsedTarget.toString(), {
-          method: request.method,
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Accept': '*/*',
-            'Connection': 'keep-alive'
-          },
-          redirect: 'follow'
-        });
+        let currentUrl = targetUrl;
+        let response;
+
+        // Follow up to 3 ZTE IPTV 302 redirects manually to capture the final edge IP path
+        for (let i = 0; i < 3; i++) {
+          response = await fetch(currentUrl, {
+            method: 'GET',
+            headers: {
+              'User-Agent': 'Lavf/58.76.100',
+              'Accept': '*/*'
+            },
+            redirect: 'manual'
+          });
+
+          if (response.status >= 300 && response.status < 400) {
+            const location = response.headers.get('location');
+            if (location) {
+              currentUrl = new URL(location, currentUrl).toString();
+              continue;
+            }
+          }
+          break;
+        }
 
         const contentType = response.headers.get('content-type') || '';
         const newHeaders = new Headers(response.headers);
@@ -46,17 +56,16 @@ export default {
         newHeaders.set('Access-Control-Expose-Headers', '*');
         newHeaders.delete('Content-Security-Policy');
 
-        // Rewrite MPD manifests so relative segment requests route through /proxy
-        if (targetUrl.includes('.mpd') || contentType.includes('dash+xml') || contentType.includes('xml')) {
+        if (currentUrl.includes('.mpd') || contentType.includes('dash+xml') || contentType.includes('xml')) {
           let mpdText = await response.text();
-          const basePath = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
+          const cleanUrl = currentUrl.split('?')[0];
+          const basePath = cleanUrl.substring(0, cleanUrl.lastIndexOf('/') + 1);
           const proxyBase = `${url.origin}/proxy?base=${encodeURIComponent(basePath)}&seg=`;
 
-          if (!mpdText.includes('<BaseURL>')) {
-            mpdText = mpdText.replace(
-              /(<MPD[^>]*>)/i,
-              `$1\n<BaseURL>${proxyBase.replace(/&/g, '&amp;')}</BaseURL>`
-            );
+          if (mpdText.includes('<BaseURL>')) {
+            mpdText = mpdText.replace(/<BaseURL>.*?<\/BaseURL>/gi, `<BaseURL>${proxyBase.replace(/&/g, '&amp;')}</BaseURL>`);
+          } else {
+            mpdText = mpdText.replace(/(<MPD[^>]*>)/i, `$1\n<BaseURL>${proxyBase.replace(/&/g, '&amp;')}</BaseURL>`);
           }
 
           return new Response(mpdText, {
@@ -70,14 +79,19 @@ export default {
           headers: newHeaders
         });
       } catch (err) {
-        return new Response(`Proxy Error: ${err.message}`, {
+        return new Response(JSON.stringify({
+          error: 'Cloudflare Workers blocks outbound port 6610 on raw IPs.',
+          details: err.message
+        }), {
           status: 502,
-          headers: { 'Access-Control-Allow-Origin': '*' }
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
+          }
         });
       }
     }
 
-    // Serve static files (index.html, logos, etc.) from ./public
     return env.ASSETS.fetch(request);
   }
 };
